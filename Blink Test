@@ -72,6 +72,12 @@ MIN_FPS = 15.0                # 2-frame blink detection needs a reasonable frame
 LOGO_PATH = "logo.png"        # path to your logo PNG
 LOGO_HEIGHT = 110             # height to resize logo to (pixels)
 
+# ONEIROS broker: replace the placeholder with the space-node laptop's IP once it is announced.
+# While it is still "BROKER_IP", the script saves files and does not try to connect.
+MQTT_HOST = "BROKER_IP"
+MQTT_PORT = 1883               # plain MQTT, no authentication (per the contract)
+BROKER_PLACEHOLDER = "BROKER_IP"
+
 PRE, POST = "PRE-EVA", "POST-EVA"
 COLORS = {PRE: (255, 150, 60), POST: (60, 60, 255)}   # BGR: blue / red
 QUIT_KEYS = (ord("q"), 27)
@@ -810,8 +816,8 @@ def main(argv=None):
     ap.add_argument("--origin", choices=["auto", "live", "replay", "synthetic"], default="auto",
                     help="auto = live for a camera index, replay for a video file")
     ap.add_argument("--schema", default=str(Path(__file__).with_name("oneiros-contract.schema.json")))
-    ap.add_argument("--mqtt-host", help="broker host; publishes cv.raw there")
-    ap.add_argument("--mqtt-port", type=int, default=1883)
+    ap.add_argument("--mqtt-host", help="broker host (overrides MQTT_HOST at the top of the file)")
+    ap.add_argument("--mqtt-port", type=int, default=MQTT_PORT)
     ap.add_argument("--mqtt-transport", choices=["tcp", "websockets"], default="tcp")
     args = ap.parse_args(argv)
     outdir = Path(args.outdir)
@@ -830,14 +836,18 @@ def main(argv=None):
         print(f"ONEIROS: src={contract.src} person={contract.person} "
               f"session={contract.session} origin={contract.origin}")
 
+    mqtt_host = args.mqtt_host or (None if MQTT_HOST == BROKER_PLACEHOLDER else MQTT_HOST)
+    if contract is not None and not mqtt_host:
+        print("MQTT: broker host not set (still the BROKER_IP placeholder) - saving files only")
+
     station = Station(args.camera, args.width, args.height)
     mqtt_client = None
     try:
-        if contract is not None and args.mqtt_host:
+        if contract is not None and mqtt_host:
             try:
-                mqtt_client = OneirosMqtt(args.mqtt_host, args.mqtt_port, contract.src,
+                mqtt_client = OneirosMqtt(mqtt_host, args.mqtt_port, contract.src,
                                           args.mqtt_transport)
-                print(f"Connected to broker {args.mqtt_host}:{args.mqtt_port}")
+                print(f"Connected to broker {mqtt_host}:{args.mqtt_port}")
             except Exception as e:   # keep measuring; data is still saved locally
                 print(f"WARNING: could not connect to the broker ({e}); saving files only")
 
