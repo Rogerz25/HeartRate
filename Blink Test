@@ -1,0 +1,868 @@
+"""
+MORPHEUS blink / yawn test: PRE-EVA vs POST-EVA   (JSON output, ONEIROS cv.raw)
+
+Tracks blinks, eye closure and yawns from the camera (MediaPipe Face Mesh) during
+two 30-second trials and saves each trial as JSON. No Excel, no charts.
+
+Workflow
+  1. PRE-EVA starts automatically; its 30 s window opens at the first frame with a face.
+  2. When it finishes, press  P  to start POST-EVA (P is ignored until PRE-EVA is done).
+  3. Each trial is saved as JSON. With --person it is also built into an ONEIROS
+     cv.raw message (test "blink"), validated against the contract schema and,
+     with --mqtt-host, published.
+
+Windows (event time, tumbling, non-overlapping)
+  A trial is ONE 30 s window [t0, t0 + 30). t0 is the capture time of the first
+  frame with a face. A frame belongs to a window by the time it was CAPTURED, not
+  when it was processed. Start inclusive, end exclusive: nothing is in two windows,
+  and POST-EVA only starts after PRE-EVA's window has closed.
+  A blink or yawn belongs to the window in which it BEGAN. If one is still in
+  progress when the window ends, the window stays open (at most GRACE_MAX_S) only
+  to let that episode finish; frames after t0 + 30 add nothing else.
+
+Files (in --outdir, default ./eva_data)
+  blink_pre_eva_<timestamp>.json, blink_post_eva_<timestamp>.json, eva_blink_schema.json
+  With --person: blink_pre_eva_<timestamp>.cv_raw.json / blink_post_eva_...cv_raw.json
+
+Install:  pip install opencv-python numpy "mediapipe==0.10.21" jsonschema paho-mqtt
+Run:      python Drowsiness_json.py
+          python Drowsiness_json.py --person PSEUDO-001 --session s-2026-11-13-01 --mqtt-host BROKER_IP
+          python Drowsiness_json.py --camera recording.mp4 --person PSEUDO-001   (replay a video)
+Keys:     P = start POST-EVA,  m = face mesh on/off,  q / ESC = quit
+
+This is a demo tool, not a medical device.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+import cv2
+import mediapipe as mp
+import numpy as np
+
+# ----------------------------------------------------------------- settings ---
+TRIAL_SEC = 30                # length of each trial = the event-time window
+GRACE_MAX_S = 8.0             # max extra time to let a blink/yawn that began inside finish
+
+# Blink detection parameters
+EAR_THRESHOLD = 0.25          # Eye Aspect Ratio
+BLINK_FRAME_THRESHOLD = 2
+LONG_CLOSURE_MS = 400         # a blink at least this long counts as a "long closure"
+
+# Yawn detection parameters
+YAWN_THRESHOLD = 0.22
+YAWN_FRAME_THRESHOLD = 15
+
+# Data quality
+MAX_FRAME_DT = 0.25           # a longer gap between frames is not counted as valid time
+MIN_VALID_S = 5.0             # rates / percentages need at least this much valid time
+MIN_COVERAGE_PCT = 50.0       # below this the window has too little data
+MAX_FACE_GAP_S = 3.0          # a longer stretch without a face is flagged
+MIN_FPS = 15.0                # 2-frame blink detection needs a reasonable frame rate
+
+LOGO_PATH = "logo.png"        # path to your logo PNG
+LOGO_HEIGHT = 110             # height to resize logo to (pixels)
+
+PRE, POST = "PRE-EVA", "POST-EVA"
+COLORS = {PRE: (255, 150, 60), POST: (60, 60, 255)}   # BGR: blue / red
+QUIT_KEYS = (ord("q"), 27)
+P_KEYS = (ord("p"), ord("P"))
+WIN = "MORPHEUS: Eye & Mouth Fatigue Tracker"
+
+# ONEIROS contract
+MQTT_TOPIC_BLINK = "oneiros/cv/blink/raw"
+MAX_CV_RAW_BYTES = 8 * 1024   # contract size limit for cv.raw
+
+# ------------------------------------------------------------ landmark indices ---
+# Extended eye landmark indices for better EAR calculation
+left_eye_indices = [33, 160, 158, 133, 153, 144, 163, 7,
+                    246, 161, 160, 159, 158, 157, 173, 133,
+                    155, 154, 153, 145, 144, 163, 7]
+right_eye_indices = [362, 385, 387, 263, 373, 380, 373, 373,
+                     466, 388, 387, 386, 385, 384, 398, 263,
+                     249, 390, 373, 374, 380, 381, 382]
+
+# Pupil landmark indices (iris landmarks)
+left_pupil_indices = [468, 469, 470, 471, 472]
+right_pupil_indices = [473, 474, 475, 476, 477]
+
+# Mouth landmark indices for yawn detection
+mouth_indices = [61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+                 291, 308, 324, 318, 402, 317, 14, 87, 178, 88, 95]
+
+# Eye contours (for drawing)
+LEFT_EYE_CONTOUR = [33, 160, 158, 133, 153, 144]
+RIGHT_EYE_CONTOUR = [362, 385, 387, 263, 373, 380]
+
+# Mouth
+UPPER_LIP = 13
+LOWER_LIP = 14
+LEFT_MOUTH_CORNER = 61
+RIGHT_MOUTH_CORNER = 291
+
+
+# ============================================================ helper functions ===
+def draw_points(frame, landmarks, indices, w, h, color, radius=2):
+    for i in indices:
+        x = int(landmarks[i].x * w)
+        y = int(landmarks[i].y * h)
+        cv2.circle(frame, (x, y), radius, color, -1)
+
+
+def overlay_logo(frame, logo):
+    h, w = frame.shape[:2]
+    lh, lw = logo.shape[:2]
+    x_offset = w - lw - 0
+    y_offset = h - lh - 0
+    if x_offset < 0 or y_offset < 0:      # frame smaller than the logo
+        return
+
+    if logo.shape[2] == 4:  # RGBA logo
+        alpha = logo[:, :, 3] / 255.0
+        for c in range(3):
+            frame[y_offset:y_offset+lh, x_offset:x_offset+lw, c] = (
+                alpha * logo[:, :, c] +
+                (1 - alpha) * frame[y_offset:y_offset+lh, x_offset:x_offset+lw, c]
+            )
+    else:
+        frame[y_offset:y_offset+lh, x_offset:x_offset+lw] = logo
+
+
+def load_logo():
+    logo = cv2.imread(LOGO_PATH, cv2.IMREAD_UNCHANGED)  # RGBA
+    if logo is None:
+        print("Warning: Logo not found. Continuing without logo.")
+        return None
+    scale = LOGO_HEIGHT / logo.shape[0]
+    return cv2.resize(logo, (int(logo.shape[1] * scale), LOGO_HEIGHT))
+
+
+def calculate_ear(landmarks, eye_indices):
+    """Calculate Eye Aspect Ratio (EAR) for blink detection"""
+    eye_points = []
+    for idx in eye_indices:
+        eye_points.append([
+            landmarks[idx].x,
+            landmarks[idx].y
+        ])
+
+    eye_points = np.array(eye_points, dtype=np.float32)
+
+    # Calculate vertical distances
+    vertical_dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])
+    vertical_dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])
+
+    # Calculate horizontal distance
+    horizontal_dist = np.linalg.norm(eye_points[0] - eye_points[3])
+
+    if horizontal_dist == 0:
+        return 0
+
+    ear = (vertical_dist_1 + vertical_dist_2) / (2.0 * horizontal_dist)
+    return ear
+
+
+def calculate_mar(landmarks):
+    """Calculate Mouth Aspect Ratio (MAR) for yawn detection"""
+    mouth_points = []
+    for idx in mouth_indices:
+        mouth_points.append([
+            landmarks[idx].x,
+            landmarks[idx].y
+        ])
+
+    mouth_points = np.array(mouth_points, dtype=np.float32)
+
+    # Calculate vertical distance
+    upper_lip = np.mean(mouth_points[0:10], axis=0)
+    lower_lip = np.mean(mouth_points[10:20], axis=0)
+    vertical_dist = np.linalg.norm(upper_lip - lower_lip)
+
+    # Calculate horizontal distance
+    left_corner = mouth_points[0]
+    right_corner = mouth_points[6]
+    horizontal_dist = np.linalg.norm(left_corner - right_corner)
+
+    if horizontal_dist == 0:
+        return 0
+
+    mar = vertical_dist / horizontal_dist
+    return mar
+
+
+# ================================================================ data types ===
+@dataclass
+class Frame:
+    t: float            # EVENT time: when the frame was captured (monotonic seconds)
+    face: bool          # a face was found in this frame
+    ear: float = 0.0    # average eye aspect ratio
+    mar: float = 0.0    # mouth aspect ratio
+
+
+@dataclass
+class Event:
+    onset_s: float      # seconds after the window opened
+    duration_ms: float
+
+
+class EpisodeTracker:
+    """Runs of consecutive frames where a condition holds (blink: eyes closed,
+    yawn: mouth open). A run counts once it reaches `min_frames`, when it ends."""
+
+    def __init__(self, min_frames: int):
+        self.min_frames = min_frames
+        self.reset()
+
+    def reset(self):
+        self.frames = 0
+        self.onset: Optional[float] = None
+
+    @property
+    def ongoing(self) -> bool:
+        return self.frames > 0
+
+    def update(self, active: bool, t: float):
+        """Feed one frame. Returns (onset_time, duration_s) when a qualifying
+        episode has just ended, otherwise None."""
+        if active:
+            if self.frames == 0:
+                self.onset = t
+            self.frames += 1
+            return None
+        done = (self.onset, t - self.onset) if self.frames >= self.min_frames else None
+        self.reset()
+        return done
+
+
+class Trial:
+    """One 30 s event-time window [t0, t0 + length) of blink / yawn measurements."""
+
+    def __init__(self, label: str, length: float = TRIAL_SEC):
+        self.label = label
+        self.length = float(length)
+        self.t0: Optional[float] = None          # event time the window opened
+        self.started_at: Optional[datetime] = None
+        self.blink_tracker = EpisodeTracker(BLINK_FRAME_THRESHOLD)
+        self.yawn_tracker = EpisodeTracker(YAWN_FRAME_THRESHOLD)
+        self.ears: List[float] = []              # per-frame EAR of valid in-window frames
+        self.valid_s = 0.0                       # time covered by frames with a face
+        self.closed_s = 0.0                      # part of it with eyes closed
+        self.blinks: List[Event] = []            # blinks that BEGAN inside the window
+        self.yawns: List[Event] = []
+        self.max_gap_s = 0.0                     # longest stretch without a usable frame
+        self.truncated = False
+        self.done = False
+        self._last_t: Optional[float] = None     # last valid frame inside the window
+
+    @property
+    def t1(self) -> Optional[float]:             # end of the window (exclusive)
+        return None if self.t0 is None else self.t0 + self.length
+
+    def remaining(self, now: float) -> Optional[float]:
+        return None if self.t0 is None else max(0.0, self.t1 - now)
+
+    # -- feeding frames -------------------------------------------------------
+    def feed(self, f: Frame) -> None:
+        if self.done:
+            return
+        if self.t0 is None:                      # window opens at the first face
+            if not f.face:
+                return
+            self.t0, self.started_at = f.t, datetime.now()
+        if f.t < self.t1:
+            self._in_window(f)
+        else:
+            self._finish_open_episodes(f)
+
+    def _add(self, events: List[Event], onset: float, duration_s: float):
+        events.append(Event(onset_s=math.floor((onset - self.t0) * 1000) / 1000,
+                            duration_ms=round(duration_s * 1000, 1)))
+
+    def _in_window(self, f: Frame):
+        if not f.face:                           # lost the face: drop open episodes
+            self.blink_tracker.reset()
+            self.yawn_tracker.reset()
+            return
+        if self._last_t is None:
+            dt = 0.0
+        else:
+            gap = f.t - self._last_t
+            dt = min(gap, MAX_FRAME_DT)
+            if gap > MAX_FRAME_DT:
+                self.max_gap_s = max(self.max_gap_s, gap)
+        self._last_t = f.t
+        self.valid_s += dt
+
+        closed = f.ear < EAR_THRESHOLD
+        if closed:
+            self.closed_s += dt
+        self.ears.append(float(f.ear))
+
+        ended = self.blink_tracker.update(closed, f.t)
+        if ended:
+            self._add(self.blinks, *ended)
+        ended = self.yawn_tracker.update(f.mar > YAWN_THRESHOLD, f.t)
+        if ended:
+            self._add(self.yawns, *ended)
+
+    def _finish_open_episodes(self, f: Frame):
+        """The window is over. Only episodes that began inside it may still finish."""
+        pending = [(self.blink_tracker, self.blinks, f.face and f.ear < EAR_THRESHOLD),
+                   (self.yawn_tracker, self.yawns, f.face and f.mar > YAWN_THRESHOLD)]
+        for tracker, events, active in pending:
+            if not tracker.ongoing:
+                continue
+            if not f.face:
+                tracker.reset()                  # lost the face: drop it
+            elif f.t - self.t1 > GRACE_MAX_S:
+                if tracker.frames >= tracker.min_frames:   # still going: keep a lower bound
+                    self._add(events, tracker.onset, f.t - tracker.onset)
+                    self.truncated = True
+                tracker.reset()
+            else:
+                ended = tracker.update(active, f.t)
+                if ended:
+                    self._add(events, *ended)
+        if not (self.blink_tracker.ongoing or self.yawn_tracker.ongoing):
+            self.done = True
+
+    # -- results ----------------------------------------------------------------
+    def metrics(self) -> dict:
+        """Contract blink metrics. A metric that cannot be computed is omitted."""
+        m = {}
+        if self.ears:
+            ears = np.array(self.ears)
+            m["ear_median"] = round(float(np.median(ears)), 3)
+            m["ear_p10"] = round(float(np.percentile(ears, 10)), 3)
+        if self.valid_s >= MIN_VALID_S:
+            m["blink_rate_per_min"] = round(len(self.blinks) / (self.valid_s / 60.0), 1)
+            m["eyes_closed_pct"] = round(100.0 * self.closed_s / self.valid_s, 1)
+            m["yawn_count"] = len(self.yawns)
+            if self.blinks:
+                d = np.array([b.duration_ms for b in self.blinks])
+                m["median_duration_ms"] = round(float(np.median(d)), 1)
+                m["p90_duration_ms"] = round(float(np.percentile(d, 90)), 1)
+                m["long_closure_pct"] = round(100.0 * float(np.mean(d >= LONG_CLOSURE_MS)), 1)
+        return m
+
+    def quality(self) -> dict:
+        """Contract quality block: quality_ok and data_sufficient are separate flags."""
+        coverage = min(100.0, 100.0 * self.valid_s / self.length)
+        gap = self.max_gap_s
+        if self.done and self._last_t is not None:
+            gap = max(gap, self.t1 - self._last_t)           # face lost at the end
+        fps = (len(self.ears) - 1) / self.valid_s if self.valid_s > 0 and len(self.ears) > 1 else 0.0
+        issues = []
+        if coverage < MIN_COVERAGE_PCT:
+            issues.append("low_coverage")
+        if gap > MAX_FACE_GAP_S:
+            issues.append("face_lost_gap")
+        if 0 < fps < MIN_FPS:
+            issues.append("low_frame_rate")
+        if self.truncated:
+            issues.append("episode_truncated")
+        return {"quality_ok": not issues,
+                "data_sufficient": coverage >= MIN_COVERAGE_PCT,
+                "sample_count": len(self.ears),
+                "valid_coverage_pct": round(coverage, 1),
+                "issues": issues}
+
+
+def windows_overlap(a: Trial, b: Trial) -> bool:
+    """True if two trials' [t0, t0 + length) event-time windows share any instant."""
+    return a.t0 < b.t0 + b.length and b.t0 < a.t0 + a.length
+
+
+# ============================================================== local JSON file ===
+SCHEMA_VERSION = "1.0"
+
+_EVENT = {
+    "type": "object",
+    "required": ["onset_s", "duration_ms"],
+    "additionalProperties": False,
+    "properties": {
+        "onset_s": {"type": "number", "minimum": 0, "exclusiveMaximum": TRIAL_SEC},
+        "duration_ms": {"type": "number", "minimum": 0},
+    },
+}
+
+BLINK_TRIAL_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "EVA Blink Trial",
+    "type": "object",
+    "required": ["schema_version", "trial", "window_seconds", "started_at",
+                 "metrics", "quality", "blinks", "yawns"],
+    "additionalProperties": False,
+    "properties": {
+        "schema_version": {"type": "string"},
+        "trial": {"type": "string", "enum": [PRE, POST]},
+        "window_seconds": {"type": "number", "const": TRIAL_SEC,
+                           "description": "Length of the event-time window [start, start + window)"},
+        "started_at": {"type": ["string", "null"], "format": "date-time"},
+        "metrics": {"type": "object", "additionalProperties": {"type": "number"}},
+        "quality": {
+            "type": "object",
+            "required": ["quality_ok", "data_sufficient"],
+            "properties": {
+                "quality_ok": {"type": "boolean"},
+                "data_sufficient": {"type": "boolean"},
+                "sample_count": {"type": "integer", "minimum": 0},
+                "valid_coverage_pct": {"type": "number", "minimum": 0, "maximum": 100},
+                "issues": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        "blinks": {"type": "array", "items": _EVENT},
+        "yawns": {"type": "array", "items": _EVENT},
+    },
+}
+
+
+def trial_to_dict(trial: Trial) -> dict:
+    """Convert a trial to a dict that matches BLINK_TRIAL_SCHEMA."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "trial": trial.label,
+        "window_seconds": trial.length,
+        "started_at": trial.started_at.isoformat(timespec="milliseconds") if trial.started_at else None,
+        "metrics": trial.metrics(),
+        "quality": trial.quality(),
+        "blinks": [{"onset_s": e.onset_s, "duration_ms": e.duration_ms} for e in trial.blinks],
+        "yawns": [{"onset_s": e.onset_s, "duration_ms": e.duration_ms} for e in trial.yawns],
+    }
+
+
+def trial_stem(trial: Trial) -> str:
+    stamp = (trial.started_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"blink_{trial.label.lower().replace('-', '_')}_{stamp}"
+
+
+def save_trial(trial: Trial, outdir: Path) -> Path:
+    """Write the trial to JSON (and the schema file once) and return the path."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    schema_path = outdir / "eva_blink_schema.json"
+    if not schema_path.exists():
+        schema_path.write_text(json.dumps(BLINK_TRIAL_SCHEMA, indent=2))
+    path = outdir / f"{trial_stem(trial)}.json"
+    path.write_text(json.dumps(trial_to_dict(trial), indent=2))
+    return path
+
+
+# ===================================================== ONEIROS contract ======
+@dataclass
+class ContractConfig:
+    src: str        # publisher client ID, also the MQTT client ID
+    person: str     # pseudonymous crew ID (never a name)
+    session: str    # shared by all three CV tests in one session
+    origin: str     # live | replay | synthetic
+
+
+def make_contract_config(src: str, person: str, session: str, origin: str) -> ContractConfig:
+    """Apply the contract's person-ID prefix rules for non-live data."""
+    if origin == "replay" and not person.startswith("REPLAY-"):
+        person = "REPLAY-" + person
+    if origin == "synthetic" and not person.startswith("SYNTH-"):
+        person = "SYNTH-" + person
+    return ContractConfig(src, person, session, origin)
+
+
+def load_validator(schema_path: Path):
+    """jsonschema validator for the contract schema, or None (with a warning)."""
+    try:
+        import jsonschema
+    except ImportError:
+        print("WARNING: jsonschema not installed - messages are NOT validated (pip install jsonschema)")
+        return None
+    if not schema_path.exists():
+        print(f"WARNING: schema not found at {schema_path} - messages are NOT validated")
+        return None
+    return jsonschema.Draft202012Validator(json.loads(schema_path.read_text()))
+
+
+def check_message(msg: dict, validator) -> List[str]:
+    """Size limit + schema errors for one message (empty list = valid)."""
+    errors = []
+    size = len(json.dumps(msg, separators=(",", ":")).encode())
+    if size > MAX_CV_RAW_BYTES:
+        errors.append(f"message is {size} bytes, limit is {MAX_CV_RAW_BYTES}")
+    if validator is not None:
+        for e in validator.iter_errors(msg):
+            where = "/".join(str(x) for x in e.absolute_path) or "<root>"
+            errors.append(f"{where}: {e.message}")
+    return errors
+
+
+class OneirosMqtt:
+    """MQTT 3.1.1 client: last will + online status, QoS 1 publish of cv.raw."""
+
+    def __init__(self, host: str, port: int, src: str, transport: str = "tcp"):
+        import paho.mqtt.client as mqtt
+        self.status_topic = f"oneiros/status/{src}"
+        try:                                    # paho-mqtt 2.x
+            c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=src,
+                            protocol=mqtt.MQTTv311, transport=transport)
+        except AttributeError:                  # paho-mqtt 1.x
+            c = mqtt.Client(client_id=src, protocol=mqtt.MQTTv311, transport=transport)
+        c.will_set(self.status_topic, "offline", qos=1, retain=True)
+        c.connect(host, port, keepalive=15)
+        c.loop_start()
+        self.client = c
+        c.publish(self.status_topic, "online", qos=1, retain=True).wait_for_publish(5)
+
+    def publish(self, topic: str, msg: dict) -> bool:
+        info = self.client.publish(topic, json.dumps(msg), qos=1, retain=False)
+        info.wait_for_publish(5)
+        return info.is_published()
+
+    def close(self):
+        try:
+            self.client.publish(self.status_topic, "offline", qos=1, retain=True).wait_for_publish(5)
+        finally:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
+def build_cv_raw_message(trial: Trial, cfg: ContractConfig) -> dict:
+    """One ONEIROS cv.raw message for a finished blink trial."""
+    metrics = trial.metrics()
+    if not metrics:
+        raise ValueError("no face was measured in the window")
+    if any(not 0.0 <= e.onset_s < trial.length for e in trial.blinks + trial.yawns):
+        raise ValueError("an event lies outside the trial's event-time window")
+    phase = "PRE" if trial.label == PRE else "POST"
+    ts = int(trial.started_at.timestamp() * 1000)
+    duration_ms = int(trial.length * 1000)
+    msg = {
+        "ver": 1,
+        "src": cfg.src,
+        "type": "cv.raw",
+        "ts": ts,
+        "session": cfg.session,
+        "person": cfg.person,
+        "data": {
+            "test": "blink",
+            "run_id": f"{cfg.session}-blink-{phase.lower()}",
+            "phase": phase,
+            "duration_ms": duration_ms,
+            "window_start_ms": ts,                 # extra fields: the event-time window
+            "window_end_ms": ts + duration_ms,     # [start, end) - end is exclusive
+            "metrics": metrics,
+            "quality": trial.quality(),
+        },
+    }
+    if cfg.origin != "live":          # live devices may omit origin
+        msg["origin"] = cfg.origin
+    return msg
+
+
+def emit_contract_message(trial: Trial, cfg: Optional[ContractConfig], validator,
+                          outdir: Path, mqtt_client: Optional["OneirosMqtt"]):
+    """Build, validate, save and (if connected) publish the trial's cv.raw message."""
+    if cfg is None:
+        return
+    try:
+        msg = build_cv_raw_message(trial, cfg)
+    except ValueError as e:
+        print(f"{trial.label}: no ONEIROS message - {e}")
+        return
+    path = outdir / f"{trial_stem(trial)}.cv_raw.json"
+    path.write_text(json.dumps(msg, indent=2))
+    print(f"Saved {path}")
+    errors = check_message(msg, validator)
+    if errors:
+        print("  INVALID against the contract - not published:")
+        for err in errors:
+            print(f"    {err}")
+        return
+    if mqtt_client is not None:
+        ok = mqtt_client.publish(MQTT_TOPIC_BLINK, msg)
+        print(f"  Published to {MQTT_TOPIC_BLINK}" if ok else "  WARNING: publish not confirmed by broker")
+
+
+# ================================================ camera + operator display ===
+def draw_trial_card(frame, label, color, remaining, progress, state, lines=()):
+    """Trial label, countdown, progress bar and status (below the stats block)."""
+    x, y = 10, 190
+    cv2.putText(frame, label, (x, y + 10), cv2.FONT_HERSHEY_DUPLEX, 0.9, color, 2, cv2.LINE_AA)
+    if remaining is None:
+        clock = "--:--"
+    else:
+        secs = int(math.ceil(remaining))
+        clock = f"{secs // 60:02d}:{secs % 60:02d}"
+    cv2.putText(frame, clock, (x, y + 55), cv2.FONT_HERSHEY_DUPLEX, 1.4, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.rectangle(frame, (x, y + 68), (x + 230, y + 78), (110, 110, 120), 1)
+    fill = x + int(230 * min(max(progress, 0.0), 1.0))
+    cv2.rectangle(frame, (x, y + 68), (fill, y + 78), color, -1)
+    cv2.putText(frame, state, (x, y + 102), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+    for i, text in enumerate(lines):
+        cv2.putText(frame, text, (x, y + 128 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (200, 255, 200), 1, cv2.LINE_AA)
+
+
+def draw_notice(frame, message):
+    """Short operator message at the bottom of the screen."""
+    H, W = frame.shape[:2]
+    fs = max(0.7, H / 800)
+    (tw, _), _ = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, fs, 2)
+    org = (max(10, (W - tw) // 2), H - int(30 * fs))
+    cv2.putText(frame, message, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), 5, cv2.LINE_AA)
+    cv2.putText(frame, message, org, cv2.FONT_HERSHEY_SIMPLEX, fs, (80, 220, 255), 2, cv2.LINE_AA)
+
+
+class Station:
+    """Camera + face mesh + on-screen display, shared by every trial and screen."""
+
+    def __init__(self, camera, width=None, height=None):
+        self.is_file = not str(camera).isdigit()
+        self.cap = cv2.VideoCapture(camera if self.is_file else int(camera))
+        if not self.cap.isOpened():
+            raise SystemExit("Could not open the camera / video source.")
+        if width and height and not self.is_file:
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        fps = self.cap.get(cv2.CAP_PROP_FPS) if self.is_file else 0.0
+        self.file_fps = fps if fps and fps > 1 else 30.0
+        self.frame_idx = 0
+
+        self.mp_face_mesh = mp.solutions.face_mesh
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.mp_styles = mp.solutions.drawing_styles
+        self.mesh = self.mp_face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.6,
+        )
+        self.logo = load_logo()
+        self.show_mesh = True
+        self.notice, self.notice_until = "", 0.0
+        cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
+        print("MORPHEUS: Eye & Mouth Fatigue Tracker")
+        print("P = start POST-EVA | M = toggle face mesh | ESC / q = quit")
+
+    def event_time(self) -> float:
+        """When the frame just read was captured (monotonic seconds). For a video
+        file it is the position in the video, so replays are windowed correctly."""
+        if self.is_file:
+            return self.frame_idx / self.file_fps
+        return time.perf_counter()
+
+    def notify(self, message, seconds=2.5):
+        self.notice, self.notice_until = message, time.perf_counter() + seconds
+
+    def grab(self):
+        """Read a frame and measure it. Returns (frame, Frame, face_landmarks) or None."""
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        t = self.event_time()
+        self.frame_idx += 1
+        frame = cv2.flip(frame, 1)
+        res = self.mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        if not res.multi_face_landmarks:
+            return frame, Frame(t, False), None
+        face = res.multi_face_landmarks[0]
+        lm = face.landmark
+        ear = (calculate_ear(lm, left_eye_indices) + calculate_ear(lm, right_eye_indices)) / 2.0
+        return frame, Frame(t, True, float(ear), float(calculate_mar(lm))), face
+
+    def render(self, frame, f: Frame, face, trial: Optional[Trial], label, color,
+               remaining, progress, state, lines=()):
+        """Draw overlays + stats, show the frame, handle display keys. Returns the key."""
+        h, w = frame.shape[:2]
+        if face is not None:
+            lm = face.landmark
+            if self.show_mesh:
+                self.mp_drawing.draw_landmarks(
+                    frame, face, self.mp_face_mesh.FACEMESH_TESSELATION,
+                    landmark_drawing_spec=None,
+                    connection_drawing_spec=self.mp_styles.get_default_face_mesh_tesselation_style())
+            draw_points(frame, lm, LEFT_EYE_CONTOUR, w, h, (0, 255, 0))
+            draw_points(frame, lm, RIGHT_EYE_CONTOUR, w, h, (0, 255, 0))
+            draw_points(frame, lm, left_pupil_indices, w, h, (0, 0, 255), 2)
+            draw_points(frame, lm, right_pupil_indices, w, h, (0, 0, 255), 2)
+            draw_points(frame, lm, [UPPER_LIP, LOWER_LIP, LEFT_MOUTH_CORNER, RIGHT_MOUTH_CORNER],
+                        w, h, (255, 0, 0), 3)
+
+        if self.logo is not None:
+            overlay_logo(frame, self.logo)
+
+        blinks = len(trial.blinks) if trial else 0
+        yawns = len(trial.yawns) if trial else 0
+        closed_s = trial.closed_s if trial else 0.0
+        open_s = max(0.0, trial.valid_s - trial.closed_s) if trial else 0.0
+        cv2.putText(frame, f"Blinks: {blinks}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"Eyes Open: {int(open_s // 60)}m {int(open_s % 60)}s", (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"Eyes Closed: {int(closed_s // 60)}m {int(closed_s % 60)}s", (10, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, f"Yawns: {yawns}", (10, 120),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        if f.face:
+            cv2.putText(frame, f"E.A.R.: {f.ear:.3f}", (10, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            closed = f.ear < EAR_THRESHOLD
+            cv2.putText(frame, "EYES CLOSED" if closed else "EYES OPEN", (w - 150, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255) if closed else (0, 255, 0), 2)
+
+        draw_trial_card(frame, label, color, remaining, progress, state, lines)
+        if time.perf_counter() < self.notice_until:
+            draw_notice(frame, self.notice)
+        cv2.imshow(WIN, frame)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord("m"):
+            self.show_mesh = not self.show_mesh
+        return key
+
+    def close(self):
+        self.mesh.close()
+        self.cap.release()
+        cv2.destroyAllWindows()
+
+
+# =============================================================== trial screens ===
+def run_trial(station: Station, label: str) -> Optional[Trial]:
+    """Run one 30 s window. Returns the Trial, or None if the operator quit or the
+    camera / video ended before it finished."""
+    trial = Trial(label)
+    color = COLORS[label]
+    while True:
+        got = station.grab()
+        if got is None:
+            print(f"{label}: the camera / video ended before the window was complete.")
+            return None
+        frame, f, face = got
+        trial.feed(f)
+
+        if trial.t0 is None:
+            state, remaining, progress = "WAITING FOR FACE...", None, 0.0
+        elif f.t < trial.t1:
+            state, remaining = "RECORDING", trial.remaining(f.t)
+            progress = (f.t - trial.t0) / trial.length
+        else:
+            state, remaining, progress = "FINISHING LAST BLINK/YAWN...", 0.0, 1.0
+
+        key = station.render(frame, f, face, trial, label, color, remaining, progress, state)
+        if key in QUIT_KEYS:
+            return None
+        if key in P_KEYS:
+            station.notify("PRE-EVA must finish before POST-EVA can start"
+                           if label == PRE else "POST-EVA is already in progress")
+        if trial.done:
+            return trial
+
+
+def summary_line(trial: Trial) -> str:
+    m = trial.metrics()
+    rate = f"{m['blink_rate_per_min']:.1f}/min" if "blink_rate_per_min" in m else "n/a"
+    return f"{trial.label}: {len(trial.blinks)} blinks ({rate}), {len(trial.yawns)} yawns"
+
+
+def wait_for_post(station: Station, pre: Trial) -> bool:
+    """Live view between trials. Returns True when the operator presses P, False on quit."""
+    lines = [summary_line(pre)]
+    while True:
+        got = station.grab()
+        if got is None:
+            return False
+        frame, f, face = got
+        key = station.render(frame, f, face, None, POST, COLORS[POST], None, 0.0,
+                             "READY - press P to start", lines)
+        if key in QUIT_KEYS:
+            return False
+        if key in P_KEYS:
+            return True
+
+
+def print_summary(trial: Trial):
+    q = trial.quality()
+    m = trial.metrics()
+    print(f"{summary_line(trial)}  (valid {trial.valid_s:.1f}s of {trial.length:.0f}s, "
+          f"{q['valid_coverage_pct']}% coverage)")
+    if "eyes_closed_pct" in m:
+        extra = f", median blink {m['median_duration_ms']} ms" if "median_duration_ms" in m else ""
+        print(f"  eyes closed {m['eyes_closed_pct']}%{extra}")
+    if q["issues"]:
+        print("  issues: " + ", ".join(q["issues"]))
+
+
+# ------------------------------------------------------------------- main ---
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="PRE-EVA vs POST-EVA blink / yawn trials")
+    ap.add_argument("--camera", default="0", help="camera index or video file path")
+    ap.add_argument("--width", type=int, default=None)
+    ap.add_argument("--height", type=int, default=None)
+    ap.add_argument("--outdir", default="eva_data")
+    # ONEIROS contract output (enabled by --person)
+    ap.add_argument("--person", help="pseudonymous crew ID, e.g. PSEUDO-001 (enables cv.raw messages)")
+    ap.add_argument("--session", help="session ID shared by blink/arm/rppg (default: generated)")
+    ap.add_argument("--src", default="cv-blink-01", help="client ID / src (lowercase, digits, hyphens)")
+    ap.add_argument("--origin", choices=["auto", "live", "replay", "synthetic"], default="auto",
+                    help="auto = live for a camera index, replay for a video file")
+    ap.add_argument("--schema", default=str(Path(__file__).with_name("oneiros-contract.schema.json")))
+    ap.add_argument("--mqtt-host", help="broker host; publishes cv.raw there")
+    ap.add_argument("--mqtt-port", type=int, default=1883)
+    ap.add_argument("--mqtt-transport", choices=["tcp", "websockets"], default="tcp")
+    args = ap.parse_args(argv)
+    outdir = Path(args.outdir)
+
+    contract = validator = None
+    if args.mqtt_host and not args.person:
+        ap.error("--mqtt-host needs --person")
+    if args.person:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", args.src):
+            ap.error("--src must be lowercase letters, digits and hyphens")
+        origin = args.origin if args.origin != "auto" else (
+            "live" if str(args.camera).isdigit() else "replay")
+        session = args.session or datetime.now().strftime("s-%Y-%m-%d-%H%M%S")
+        contract = make_contract_config(args.src, args.person, session, origin)
+        validator = load_validator(Path(args.schema))
+        print(f"ONEIROS: src={contract.src} person={contract.person} "
+              f"session={contract.session} origin={contract.origin}")
+
+    station = Station(args.camera, args.width, args.height)
+    mqtt_client = None
+    try:
+        if contract is not None and args.mqtt_host:
+            try:
+                mqtt_client = OneirosMqtt(args.mqtt_host, args.mqtt_port, contract.src,
+                                          args.mqtt_transport)
+                print(f"Connected to broker {args.mqtt_host}:{args.mqtt_port}")
+            except Exception as e:   # keep measuring; data is still saved locally
+                print(f"WARNING: could not connect to the broker ({e}); saving files only")
+
+        pre = run_trial(station, PRE)                       # starts automatically
+        if pre is None:
+            return
+        print(f"Saved {save_trial(pre, outdir)}")
+        print_summary(pre)
+        emit_contract_message(pre, contract, validator, outdir, mqtt_client)
+
+        if not wait_for_post(station, pre):                 # waits for the P key
+            return
+        post = run_trial(station, POST)
+        if post is None:
+            return
+        if windows_overlap(pre, post):
+            print("WARNING: PRE-EVA and POST-EVA windows overlap - this should not happen")
+        print(f"Saved {save_trial(post, outdir)}")
+        print_summary(post)
+        emit_contract_message(post, contract, validator, outdir, mqtt_client)
+    finally:
+        if mqtt_client is not None:
+            mqtt_client.close()
+        station.close()
+
+
+if __name__ == "__main__":
+    main()
